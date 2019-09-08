@@ -1,9 +1,4 @@
-import numpy as onp
-from jax.experimental import stax
-from jax import numpy as np
-from jax import scipy as sp
-from jax.scipy.special import logsumexp
-from jax import grad, vmap
+import torch
 from scipy.optimize import root_scalar
 from scipy.stats import gaussian_kde
 
@@ -21,17 +16,17 @@ class Loss:
 
     def cumulative_hazard(self, params, t):
         # must override this or survival_function
-        return -np.log(self.survival_function(params, t))
+        return -torch.log(self.survival_function(params, t))
 
     def survival_function(self, params, t):
         # must override this or cumulative_hazard
-        return np.exp(-self.cumulative_hazard(params, t))
+        return torch.exp(-self.cumulative_hazard(params, t))
 
     def hazard(self, params, t):
-        return grad(self.cumulative_hazard, argnums=1)(params, t)
+        return self.cumulative_hazard(params, t)
 
     def log_hazard(self, params, t):
-        return np.log(np.maximum(self.hazard(params, t), 1e-30))
+        return torch.log(torch.clamp(self.hazard(params, t), 1e-30))
 
     def inform(self, **kwargs):
         pass
@@ -71,22 +66,24 @@ class ParametricMixture(Loss):
 
     def cumulative_hazard(self, params, t):
         # weights
-        p1, p2, p3 = np.maximum(stax.softmax(params[:3]), 1e-25)
+        ln_p = params[:3] - torch.logsumexp(params[:3], -1)
+        ln_p1, ln_p2, ln_p3 = ln_p
+        # p1, p2, p3 = torch.clamp(torch.softmax(params[:3]), 1e-25)
 
         # weibull params
-        lambda_, rho_ = np.exp(params[3]), np.exp(params[4])
+        lambda_, rho_ = torch.exp(params[3]), torch.exp(params[4])
 
         # loglogistic params
-        alpha_, beta_ = np.exp(params[5]), np.exp(params[6])
+        # alpha_, beta_ = torch.exp(params[5]), torch.exp(params[6])
+        ln_alpha, ln_beta = params[5:7]
+        term2 = torch.log(t) - ln_alpha
 
-        v = -sp.special.logsumexp(
-            np.hstack(
+        v = -torch.logsumexp(
+            torch.hstack(
                 (
-                    np.log(p1) - (t / lambda_) ** rho_,
-                    np.log(p2) - sp.special.logsumexp(np.hstack(
-                        (0, beta_ * np.log(t) - beta_ * np.log(alpha_)))
-                    ),
-                    np.log(p3),
+                    ln_p1 - (t / lambda_) ** rho_,
+                    ln_p2 - torch.logsumexp(torch.stack((0, torch.exp(ln_beta) * term2))),
+                    ln_p3,
                 )
             )
         )
@@ -96,7 +93,7 @@ class ParametricMixture(Loss):
 class PiecewiseConstant(Loss):
     def __init__(self, breakpoints):
         self.N_OUTPUTS = len(breakpoints) + 1
-        self.breakpoints = np.hstack(([0], breakpoints, [np.inf]))
+        self.breakpoints = torch.hstack(([0], breakpoints, torch.tensor([np.inf])))
         self.terminal_layer = [
             stax.Dense(
                 self.N_OUTPUTS, W_init=stax.randn(1e-7), b_init=stax.randn(1e-7)
@@ -115,13 +112,13 @@ class PiecewiseConstant(Loss):
         return s
 
     def cumulative_hazard(self, params, t):
-        M = np.minimum(self.breakpoints, t)
-        M = np.diff(M)
+        M = torch.minimum(self.breakpoints, t)
+        M = torch.diff(M)
         return (M * params).sum()
 
     """
     def hazard(self, params, t):
-        ix = onp.searchsorted(self.breakpoints, t)
+        ix = torch.searchsorted(self.breakpoints, t)
         or
         ix = 0
         for tau in self.breakpoints:
@@ -157,11 +154,11 @@ class NonParametric(PiecewiseConstant):
         dist = gaussian_kde(observed_event_times)
 
         if self.n_breakpoints is None:
-            n_breakpoints = min(int(np.sqrt(n_obs) / 2), onp.unique(observed_event_times).shape[0])
+            n_breakpoints = min(int(torch.sqrt(n_obs) / 2), torch.unique(observed_event_times).shape[0])
         else:
             n_breakpoints = self.n_breakpoints
 
-        breakpoints = onp.empty(n_breakpoints)
+        breakpoints = torch.empty(n_breakpoints)
 
         # We scale our pdf/cdf by CDF(max observed time) so that we will
         # never have breakpoints greater than the max observed time.
@@ -170,7 +167,7 @@ class NonParametric(PiecewiseConstant):
         CDF_M =  dist.integrate_box_1d(0, MAX)
 
         sol = 0
-        for i, p in enumerate(np.linspace(0, 1, n_breakpoints + 2)[1:-1]):
+        for i, p in enumerate(torch.linspace(0, 1, n_breakpoints + 2)[1:-1]):
             # solve the following simple root problem:
             # cdf'(x) = p
             # cdf(x)/cdf(M) = p
